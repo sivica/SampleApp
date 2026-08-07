@@ -2,6 +2,8 @@ name: Build and distribute Android test release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
@@ -24,8 +26,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: firebase-distribution
-  cancel-in-progress: false
+  group: firebase-distribution-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
 
 jobs:
   build:
@@ -88,7 +90,7 @@ jobs:
           -PversionName="${{ steps.version.outputs.version_name }}"
           -PversionCode="${{ steps.version.outputs.version_code }}"
 
-      - name: Save APK for the approval-gated job
+      - name: Save APK for the distribution job
         uses: actions/upload-artifact@v4
         with:
           name: sampleapp-${{ steps.version.outputs.version_name }}
@@ -99,10 +101,18 @@ jobs:
   distribute:
     name: Upload to Firebase App Distribution
     needs: build
-    if: github.event_name == 'push' || inputs.distribute == true
+    if: >-
+      github.ref == 'refs/heads/main' ||
+      github.ref_type == 'tag' ||
+      (github.event_name == 'workflow_dispatch' && inputs.distribute == true)
     runs-on: ubuntu-latest
     environment:
-      name: firebase-distribution
+      # Main pushes use an unprotected private-preview environment. Version tags
+      # and explicitly requested manual distributions keep the approval gate.
+      name: >-
+        ${{ (github.ref_type == 'tag' ||
+          (github.event_name == 'workflow_dispatch' && inputs.distribute == true)) &&
+          'firebase-distribution' || 'firebase-preview' }}
     permissions:
       contents: read
 
