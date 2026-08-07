@@ -1,0 +1,174 @@
+name: Build and distribute Android test release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      distribute:
+        description: "Upload this build to Firebase after the approval gate"
+        required: true
+        type: boolean
+        default: false
+      version_name:
+        description: "Version name for a manual build, for example 0.2.0"
+        required: false
+        type: string
+      version_code:
+        description: "Numeric version code for a manual build"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: firebase-distribution
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and test APK
+    runs-on: ubuntu-latest
+    outputs:
+      version_name: ${{ steps.version.outputs.version_name }}
+      version_code: ${{ steps.version.outputs.version_code }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Determine version
+        id: version
+        shell: bash
+        env:
+          VERSION_NAME_INPUT: ${{ inputs.version_name }}
+          VERSION_CODE_INPUT: ${{ inputs.version_code }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VERSION_NAME="${GITHUB_REF_NAME#v}"
+            BASE_VERSION="${VERSION_NAME%%-*}"
+            IFS='.' read -r MAJOR MINOR PATCH <<< "${BASE_VERSION}"
+            if [[ ! "${MAJOR:-}" =~ ^[0-9]+$ || ! "${MINOR:-}" =~ ^[0-9]+$ || ! "${PATCH:-}" =~ ^[0-9]+$ ]]; then
+              echo "Use a version tag like v0.2.0 or v0.2.0-debug."
+              exit 1
+            fi
+            VERSION_CODE=$((10#${MAJOR} * 1000000 + 10#${MINOR} * 1000 + 10#${PATCH}))
+          else
+            VERSION_NAME="${VERSION_NAME_INPUT:-0.1.0}"
+            VERSION_CODE="${VERSION_CODE_INPUT:-${GITHUB_RUN_NUMBER}}"
+          fi
+
+          if [[ ! "${VERSION_CODE}" =~ ^[0-9]+$ ]]; then
+            echo "version_code must be numeric."
+            exit 1
+          fi
+
+          echo "version_name=${VERSION_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "version_code=${VERSION_CODE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Run unit tests
+        run: ./gradlew --no-daemon testDebugUnitTest
+
+      - name: Build debug APK
+        run: >-
+          ./gradlew --no-daemon assembleDebug
+          -PversionName="${{ steps.version.outputs.version_name }}"
+          -PversionCode="${{ steps.version.outputs.version_code }}"
+
+      - name: Save APK for the approval-gated job
+        uses: actions/upload-artifact@v4
+        with:
+          name: sampleapp-${{ steps.version.outputs.version_name }}
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  distribute:
+    name: Upload to Firebase App Distribution
+    needs: build
+    if: github.event_name == 'push' || inputs.distribute == true
+    runs-on: ubuntu-latest
+    environment:
+      name: firebase-distribution
+    permissions:
+      contents: read
+
+    steps:
+      - name: Download built APK
+        uses: actions/download-artifact@v4
+        with:
+          name: sampleapp-${{ needs.build.outputs.version_name }}
+          path: release
+
+      - name: Check Firebase configuration
+        env:
+          FIREBASE_APP_ID: ${{ vars.FIREBASE_APP_ID }}
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${FIREBASE_APP_ID}" ]]; then
+            echo "Missing repository variable FIREBASE_APP_ID."
+            exit 1
+          fi
+          if [[ -z "${FIREBASE_SERVICE_ACCOUNT_JSON}" ]]; then
+            echo "Missing firebase-distribution environment secret FIREBASE_SERVICE_ACCOUNT_JSON."
+            exit 1
+          fi
+
+      - name: Authenticate with Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Firebase CLI
+        run: npm install --global firebase-tools
+
+      - name: Create release notes
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.build.outputs.version_name }}
+        run: |
+          {
+            echo "SampleApp ${RELEASE_VERSION}"
+            echo
+            echo "Built from ${GITHUB_SHA}."
+            echo "Review the feature changes before installing."
+          } > release-notes.txt
+
+      - name: Upload release to Firebase App Distribution
+        shell: bash
+        env:
+          FIREBASE_APP_ID: ${{ vars.FIREBASE_APP_ID }}
+          FIREBASE_TESTER_GROUP: ${{ vars.FIREBASE_TESTER_GROUP }}
+        run: |
+          set -euo pipefail
+          args=(
+            "release/app-debug.apk"
+            "--app" "${FIREBASE_APP_ID}"
+            "--release-notes-file" "release-notes.txt"
+          )
+
+          # Leave this variable empty to upload privately without notifying testers.
+          if [[ -n "${FIREBASE_TESTER_GROUP}" ]]; then
+            args+=("--groups" "${FIREBASE_TESTER_GROUP}")
+          fi
+
+          firebase appdistribution:distribute "${args[@]}"
